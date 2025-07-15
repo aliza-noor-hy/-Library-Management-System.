@@ -1,0 +1,1210 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from openpyxl import load_workbook, Workbook
+import os
+import subprocess
+from tkcalendar import DateEntry # For book lending
+from datetime import datetime, timedelta
+from collections import Counter # For counting genres/members
+
+# --- Color Palette Definitions ---
+COLOR_PRIMARY_ACCENT = "#F9957F"      # Coral Pink (for main actions, highlights)
+COLOR_GRADIENT_LIGHT = "#F2F5D0"      # Very Pale Yellow/Cream (gradient start)
+COLOR_GRADIENT_MEDIUM = "#FBC1AD"     # Light Peach (gradient mid/end, secondary elements)
+COLOR_BUTTON_SECONDARY = "#FAB7A1"    # Slightly different Peach (other buttons)
+COLOR_BUTTON_DELETE = "#E74C3C"       # Alizarin Crimson / Red (delete actions)
+COLOR_TEXT_ON_ACCENT = "white"        # Text on primary accent or dark buttons
+COLOR_TEXT_DARK = "#5D4037"           # Dark Brown (main text, titles)
+COLOR_BACKGROUND_LIGHT = "#FEF9F7"    # Very Light Pinkish Cream (main content background)
+
+# Derived/Supporting Colors for consistency
+COLOR_SIDEBAR_GRADIENT_END = "#FAD0C0" # Lighter version of primary for softer sidebar gradient end
+COLOR_SIDEBAR_BTN_BG = "#FCE4EC"       # Pale Pinkish Beige for sidebar buttons (slightly darker for visibility)
+COLOR_PROGRESS_ACTIVE = "#AED581"      # Light Green for "Available" / "Active"
+COLOR_PROGRESS_INACTIVE = COLOR_PRIMARY_ACCENT # Use primary accent for "Checked Out" / "Inactive"
+COLOR_PROGRESS_TROUGH = "#E0E0E0"      # Standard light grey for progress bar trough
+
+# --- File Constants ---
+BOOK_FILE_PATH = "Library_Books_100.xlsx"
+MEMBER_FILE_PATH = "Library_Members.xlsx"
+
+# --- Default Column Definitions ---
+MEMBER_COLUMNS_DEFAULT = ["Member ID", "Full Name", "Email", "Contact", "Start Date", "Status", "Address"]
+BOOK_COLUMNS_DESIRED = ['ISBN', 'Title', 'Author', 'Genre', 'Status', 'Borrower Name', 'Borrower ID', 'Borrow Date', 'Return Date']
+
+
+# --------------------------------------
+# -------- Gradient Functions --------
+# --------------------------------------
+
+def draw_vertical_gradient(canvas, width, height, color1, color2):
+    """Draws a vertical gradient on the given canvas."""
+    r1, g1, b1 = canvas.winfo_rgb(color1)
+    r2, g2, b2 = canvas.winfo_rgb(color2)
+    r_ratio = (r2 - r1) / height
+    g_ratio = (g2 - g1) / height
+    b_ratio = (b2 - b1) / height
+    for i in range(height):
+        nr = int(r1 + (r_ratio * i)); ng = int(g1 + (g_ratio * i)); nb = int(b1 + (b_ratio * i))
+        hex_color = f'#{nr>>8:02x}{ng>>8:02x}{nb>>8:02x}'
+        canvas.create_line(0, i, width, i, fill=hex_color)
+
+def draw_horizontal_gradient(canvas, width, height, color1, color2):
+    """Draws a horizontal gradient on the given canvas."""
+    r1, g1, b1 = canvas.winfo_rgb(color1)
+    r2, g2, b2 = canvas.winfo_rgb(color2)
+    r_ratio = (r2 - r1) / width
+    g_ratio = (g2 - g1) / width
+    b_ratio = (b2 - b1) / width
+    for i in range(width):
+        nr = int(r1 + (r_ratio * i)); ng = int(g1 + (g_ratio * i)); nb = int(b1 + (b_ratio * i))
+        hex_color = f'#{nr>>8:02x}{ng>>8:02x}{nb>>8:02x}'
+        canvas.create_line(i, 0, i, height, fill=hex_color)
+
+# -----------------------------------
+# -------- UI Helper Functions --------
+# -----------------------------------
+
+def clear_content_frame():
+    """Clears all widgets from the main content frame."""
+    for widget in content_frame.winfo_children():
+        widget.destroy()
+
+def on_nav_button_enter(e):
+    """Changes sidebar button appearance on mouse enter."""
+    e.widget['background'] = COLOR_PRIMARY_ACCENT
+    e.widget['foreground'] = COLOR_TEXT_ON_ACCENT
+
+def on_nav_button_leave(e):
+    """Resets sidebar button appearance on mouse leave."""
+    e.widget['background'] = COLOR_SIDEBAR_BTN_BG
+    e.widget['foreground'] = COLOR_TEXT_DARK
+
+# ----------------------------------------------------
+# -------- Excel Helper Functions (General) --------
+# ----------------------------------------------------
+
+def initialize_excel_file(file_path, columns):
+    """Creates an Excel file with specified columns if it doesn't exist."""
+    if not os.path.exists(file_path):
+        wb = Workbook(); ws = wb.active; ws.append(columns)
+        try:
+            wb.save(file_path)
+        except PermissionError:
+            messagebox.showerror("Error", f"Permission denied for '{file_path}'. File might be open.")
+            return False
+    return True
+
+def open_excel_file_externally(file_path, file_description="file"):
+    """Opens the specified Excel file using the default system application."""
+    if not os.path.exists(file_path):
+        messagebox.showwarning("Warning", f"{file_description} '{os.path.basename(file_path)}' not found.")
+        return
+    try:
+        if os.name == 'nt': # Windows
+            os.startfile(file_path)
+        elif os.uname().sysname == 'Darwin': # macOS
+            subprocess.run(['open', file_path], check=True)
+        else: # Linux/Unix
+            subprocess.run(['xdg-open', file_path], check=True)
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open {file_description}: {e}")
+
+# --------------------------------------------------
+# -------- Book/Member Data Functions --------
+# --------------------------------------------------
+
+def ensure_status_column(sheet): # Specifically for Book Excel to ensure all desired columns are present
+    """Ensures the book Excel sheet has all desired columns, adding them if necessary."""
+    updated = False
+    desired_cols = BOOK_COLUMNS_DESIRED
+    
+    actual_cols = [cell.value for cell in sheet[1] if cell.value is not None]
+    col_map = {header: i + 1 for i, header in enumerate(actual_cols)}
+
+    for col_name in desired_cols:
+        if col_name not in col_map:
+            insert_pos = len(actual_cols) + 1 
+            try: # Try to insert in a logical order based on desired_cols
+                prev_col_index = desired_cols.index(col_name) - 1
+                if prev_col_index >= 0 and desired_cols[prev_col_index] in col_map:
+                    insert_pos = col_map[desired_cols[prev_col_index]] + 1
+            except ValueError: 
+                pass # If not found, will append at the end
+
+            sheet.insert_cols(insert_pos)
+            sheet.cell(row=1, column=insert_pos, value=col_name)
+            
+            # Set default values for new columns
+            default_value = ''
+            if col_name == 'Status': default_value = 'Available'
+            elif col_name in ['Borrower Name', 'Borrower ID', 'Borrow Date', 'Return Date']: default_value = 'None'
+
+            for r_idx in range(2, sheet.max_row + 1): # Iterate existing rows
+                # Only add default value if the row seems to have actual data (e.g., first cell is not None)
+                if sheet.cell(row=r_idx, column=1).value is not None:
+                     sheet.cell(row=r_idx, column=insert_pos, value=default_value)
+            
+            actual_cols.insert(insert_pos - 1, col_name) # Update local list of actual columns
+            col_map = {header: i + 1 for i, header in enumerate(actual_cols)} # Remap column indices
+            updated = True
+            
+    return updated, actual_cols
+
+
+# ------------------------------------------------------------------
+# --- Functions for specific views (Book Management, Add Book) ---
+# ------------------------------------------------------------------
+
+def show_lend_return_book_view():
+    clear_content_frame()
+    container = tk.Frame(content_frame, bg=COLOR_BACKGROUND_LIGHT)
+    container.pack(fill=tk.BOTH, expand=True)
+    heading_label = tk.Label(container, text="📖 View Books & Manage Lending", font=('Cambria', 18, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK)
+    heading_label.pack(pady=(20, 10))
+    try:
+        file_path = BOOK_FILE_PATH
+        if not os.path.exists(file_path): initialize_excel_file(file_path, BOOK_COLUMNS_DESIRED)
+        wb = load_workbook(file_path); sheet = wb.active
+        updated_status, final_cols_excel_order = ensure_status_column(sheet)
+        if updated_status: wb.save(file_path); wb = load_workbook(file_path); sheet = wb.active; final_cols_excel_order = [c.value for c in sheet[1] if c.value]
+        display_columns = [col for col in final_cols_excel_order if col != 'Title']
+        tree_view_container_frame = ttk.Frame(container, style="Content.TFrame")
+        tree_view_container_frame.pack(expand=True, fill='both', padx=20, pady=10)
+        tree = ttk.Treeview(tree_view_container_frame, columns=display_columns, show='headings')
+        vsb = ttk.Scrollbar(tree_view_container_frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(tree_view_container_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        hsb.pack(side='bottom', fill='x'); vsb.pack(side='right', fill='y'); tree.pack(expand=True, fill='both')
+        for col in display_columns: tree.heading(col, text=col); tree.column(col, width=max(90, len(col)*9), anchor='center', minwidth=60)
+        col_name_to_idx = {col: i for i, col in enumerate(final_cols_excel_order)}
+        for row_num in range(2, sheet.max_row + 1):
+            vals = [sheet.cell(row=row_num, column=c_idx + 1).value for c_idx in range(len(final_cols_excel_order))]
+            display_vals = []
+            for col_name in display_columns:
+                if col_name in col_name_to_idx and col_name_to_idx[col_name] < len(vals): display_vals.append(vals[col_name_to_idx[col_name]])
+                else: display_vals.append('') 
+            tag_to_apply = ()
+            try:
+                status_idx = col_name_to_idx.get('Status'); return_date_idx = col_name_to_idx.get('Return Date')
+                if status_idx is not None and return_date_idx is not None and status_idx < len(vals) and return_date_idx < len(vals) and vals[status_idx] == 'Lend' and vals[return_date_idx]:
+                    return_date_val = vals[return_date_idx]; ret_date_obj = None
+                    if isinstance(return_date_val, datetime): ret_date_obj = return_date_val
+                    elif isinstance(return_date_val, str):
+                        try: ret_date_obj = datetime.strptime(return_date_val, "%m/%d/%y")
+                        except ValueError:
+                            try: ret_date_obj = datetime.strptime(return_date_val, "%Y-%m-%d")
+                            except ValueError:
+                                try: ret_date_obj = datetime.strptime(return_date_val.split(" ")[0], "%Y-%m-%d")
+                                except Exception: pass
+                    if ret_date_obj and ret_date_obj.date() < datetime.today().date(): tag_to_apply = ('overdue',)
+            except Exception as e_tag: print(f"Tag Error: {e_tag}")
+            tree.insert('', 'end', values=display_vals, tags=tag_to_apply)
+        tree.tag_configure('overdue', background=COLOR_PRIMARY_ACCENT, foreground=COLOR_TEXT_ON_ACCENT)
+        btn_frame_lend = tk.Frame(container, bg=COLOR_BACKGROUND_LIGHT)
+        btn_frame_lend.pack(pady=10)
+        def save_changes_to_excel_lend():
+            try:
+                temp_wb = Workbook(); temp_ws = temp_wb.active; temp_ws.append(final_cols_excel_order)
+                excel_isbn_idx = col_name_to_idx.get('ISBN', -1)
+                display_isbn_idx = display_columns.index('ISBN') if 'ISBN' in display_columns else -1
+                if excel_isbn_idx == -1 or display_isbn_idx == -1: messagebox.showerror("Error", "ISBN def missing."); return False
+                original_wb = load_workbook(file_path); original_ws = original_wb.active
+                for r_idx in range(2, original_ws.max_row + 1):
+                    curr_excel_tuple = next(original_ws.iter_rows(min_row=r_idx, max_row=r_idx, values_only=True), None)
+                    if curr_excel_tuple is None: continue
+                    curr_excel_list = list(curr_excel_tuple)
+                    while len(curr_excel_list) < len(final_cols_excel_order): curr_excel_list.append('')
+                    curr_excel_list = curr_excel_list[:len(final_cols_excel_order)]
+                    curr_excel_isbn = str(curr_excel_list[excel_isbn_idx]) if excel_isbn_idx < len(curr_excel_list) else None
+                    found = False
+                    for item_id in tree.get_children():
+                        tree_vals = tree.item(item_id)['values']
+                        tree_isbn = str(tree_vals[display_isbn_idx]) if display_isbn_idx < len(tree_vals) else None
+                        if curr_excel_isbn and tree_isbn and curr_excel_isbn == tree_isbn:
+                            for d_col_idx, d_col_name in enumerate(display_columns):
+                                if d_col_name in col_name_to_idx:
+                                    excel_actual_idx = col_name_to_idx[d_col_name]
+                                    if excel_actual_idx < len(curr_excel_list) and d_col_idx < len(tree_vals):
+                                        curr_excel_list[excel_actual_idx] = tree_vals[d_col_idx]
+                            found = True; break
+                    if found: temp_ws.append(curr_excel_list)
+                    elif curr_excel_isbn: pass 
+                    else:
+                        if any(val is not None and str(val).strip() != '' for val in curr_excel_list): temp_ws.append(curr_excel_list)
+                temp_wb.save(file_path); return True
+            except Exception as e_save: messagebox.showerror("Error", f"Save Error: {e_save}"); return False
+        def delete_selected_lend():
+            sel_items = tree.selection()
+            if not sel_items: messagebox.showwarning("Warning", "Select book to delete."); return
+            if messagebox.askyesno("Confirm", "Delete selected book(s)?"):
+                sel_isbns_del = set()
+                disp_isbn_idx = display_columns.index('ISBN') if 'ISBN' in display_columns else -1
+                if disp_isbn_idx == -1: messagebox.showerror("Error", "ISBN column not in display."); return
+                for item_id in sel_items:
+                    vals = tree.item(item_id)['values']
+                    if disp_isbn_idx < len(vals): sel_isbns_del.add(str(vals[disp_isbn_idx]))
+                    tree.delete(item_id)
+                try:
+                    wb_d = load_workbook(file_path); ws_d = wb_d.active; rows_keep = []
+                    excel_isbn_col_idx = final_cols_excel_order.index('ISBN') if 'ISBN' in final_cols_excel_order else -1
+                    if excel_isbn_col_idx == -1: messagebox.showerror("Error", "ISBN col not in Excel header."); return
+                    for r_num_d in range(2, ws_d.max_row + 1):
+                        isbn_cell_val = ws_d.cell(row=r_num_d, column=excel_isbn_col_idx + 1).value
+                        if str(isbn_cell_val) not in sel_isbns_del:
+                            rows_keep.append([ws_d.cell(row=r_num_d, column=c + 1).value for c in range(len(final_cols_excel_order))])
+                    if ws_d.max_row >= 2: ws_d.delete_rows(2, ws_d.max_row -1) 
+                    for r_data in rows_keep: ws_d.append(r_data)
+                    wb_d.save(file_path); messagebox.showinfo("Success", "Book(s) deleted.")
+                except Exception as e_del: messagebox.showerror("Error", f"Del Save Error: {e_del}"); show_lend_return_book_view()
+        def prompt_borrower_info_lend(action):
+            sel = tree.selection()
+            if not sel or len(sel) > 1: messagebox.showwarning("Warning", f"Select one book to {action}."); return
+            sel_disp_vals = list(tree.item(sel[0])['values'])
+            disp_isbn_idx = display_columns.index('ISBN') if 'ISBN' in display_columns else -1
+            if disp_isbn_idx == -1 or disp_isbn_idx >= len(sel_disp_vals): messagebox.showerror("Error", "ISBN invalid in display."); return
+            sel_isbn = str(sel_disp_vals[disp_isbn_idx])
+            orig_excel_row_vals = None
+            excel_isbn_col_idx_p = final_cols_excel_order.index('ISBN') if 'ISBN' in final_cols_excel_order else -1
+            if excel_isbn_col_idx_p == -1: messagebox.showerror("Error", "ISBN not in Excel headers."); return
+            wb_orig_p = load_workbook(file_path); sheet_orig_p = wb_orig_p.active
+            for r_idx_p in range(2, sheet_orig_p.max_row + 1):
+                if str(sheet_orig_p.cell(row=r_idx_p, column=excel_isbn_col_idx_p + 1).value) == sel_isbn:
+                    orig_excel_row_vals = [sheet_orig_p.cell(row=r_idx_p, column=c+1).value for c in range(len(final_cols_excel_order))]; break
+            if not orig_excel_row_vals: messagebox.showerror("Error", "Orig book data not found."); return
+            s_idx = col_name_to_idx.get('Status'); n_idx = col_name_to_idx.get('Borrower Name'); id_idx = col_name_to_idx.get('Borrower ID')
+            bd_idx = col_name_to_idx.get('Borrow Date'); rd_idx = col_name_to_idx.get('Return Date')
+            if None in [s_idx, n_idx, id_idx, bd_idx, rd_idx]: messagebox.showerror("Error", "Req cols missing in Excel."); return
+            curr_status = orig_excel_row_vals[s_idx] if s_idx < len(orig_excel_row_vals) else "Unknown"
+            if (action == "Lend" and curr_status == 'Lend') or (action == "Return" and curr_status == 'Available'):
+                messagebox.showinfo("Info", f"Book already {str(curr_status).lower()}.", parent=root); return
+            popup = tk.Toplevel(root); popup.title(f"{action} Book"); popup.geometry("420x380"); popup.resizable(False, False); popup.grab_set()
+            popup.configure(bg=COLOR_BACKGROUND_LIGHT)
+            tk.Label(popup, text="Borrower:", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(15,0))
+            if not os.path.exists(MEMBER_FILE_PATH): initialize_excel_file(MEMBER_FILE_PATH, MEMBER_COLUMNS_DEFAULT)
+            mem_wb = load_workbook(MEMBER_FILE_PATH); mem_ws = mem_wb.active; members = []
+            mem_h = [c.value for c in mem_ws[1] if c.value]
+            mem_id_idx = mem_h.index("Member ID") if "Member ID" in mem_h else -1
+            mem_name_idx = mem_h.index("Full Name") if "Full Name" in mem_h else -1
+            if mem_id_idx == -1 or mem_name_idx == -1: messagebox.showerror("Error", "Member file needs 'Member ID' & 'Full Name'.", parent=popup); popup.destroy(); return
+            for row in mem_ws.iter_rows(min_row=2, values_only=True):
+                if row and len(row) > max(mem_id_idx, mem_name_idx) and row[mem_id_idx] and row[mem_name_idx]:
+                    members.append((str(row[mem_id_idx]), str(row[mem_name_idx])))
+            mem_names = [f"{m[1]}" for m in members]
+            b_var = tk.StringVar(); b_dd = ttk.Combobox(popup, textvariable=b_var, values=mem_names, state='readonly', width=30)
+            b_dd.pack(pady=(0,10))
+            tk.Label(popup, text="Borrower ID:", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(10,0))
+            bid_var = tk.StringVar(); bid_entry = tk.Entry(popup, textvariable=bid_var, state='readonly', width=32)
+            bid_entry.pack()
+            tk.Label(popup, text="Borrow Date & Time:", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(10,0))
+            bdt_var = tk.StringVar(); bdt_entry = tk.Entry(popup, textvariable=bdt_var, state='readonly', width=32)
+            bdt_entry.pack()
+            dur_label = tk.Label(popup, text="Borrow Duration (days):", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK)
+            dur_var = tk.StringVar(value="7"); dur_entry = tk.Entry(popup, textvariable=dur_var, width=5)
+            rdate_label = tk.Label(popup, text="Return Date:", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK)
+            try: init_dur_days = int(dur_var.get())
+            except ValueError: init_dur_days = 7
+            def_rdate_obj = datetime.today() + timedelta(days=init_dur_days)
+            rdate_entry_w = DateEntry(popup, width=14, background=COLOR_TEXT_DARK, foreground=COLOR_TEXT_ON_ACCENT, borderwidth=2, date_pattern='yyyy-mm-dd', mindate=datetime.today())
+            rdate_entry_w.set_date(def_rdate_obj)
+            if action == "Lend":
+                dur_label.pack(pady=(10,0)); dur_entry.pack()
+                rdate_label.pack(pady=(10,0)); rdate_entry_w.pack(pady=(0,10))
+            def update_rdate_from_dur_lend(*args):
+                if action == "Lend":
+                    try:
+                        dur = int(dur_var.get())
+                        if dur > 0:
+                            sdate_str = bdt_var.get().split(" ")[0]
+                            sdate_obj = datetime.strptime(sdate_str, "%Y-%m-%d")
+                            calc_rdate = sdate_obj + timedelta(days=dur)
+                            rdate_entry_w.set_date(calc_rdate)
+                            rdate_entry_w.config(mindate=sdate_obj + timedelta(days=1))
+                        else: today_obj = datetime.today(); rdate_entry_w.set_date(today_obj); rdate_entry_w.config(mindate=today_obj)
+                    except (ValueError, IndexError): pass
+            dur_var.trace_add("write", update_rdate_from_dur_lend)
+            def on_b_select_lend(event):
+                sel_n = b_var.get(); sel_mid_val = ""
+                for mid_t, mname_t in members:
+                    if mname_t == sel_n: sel_mid_val = mid_t; break
+                bid_var.set(sel_mid_val)
+                if action == "Lend": update_rdate_from_dur_lend()
+            b_dd.bind("<<ComboboxSelected>>", on_b_select_lend)
+            if action == "Lend": bdt_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S")); update_rdate_from_dur_lend()
+            else:
+                bdt_val = orig_excel_row_vals[bd_idx] if bd_idx < len(orig_excel_row_vals) else ""
+                bdt_var.set(str(bdt_val) if bdt_val and str(bdt_val).lower() != 'none' else "")
+                bn_val = orig_excel_row_vals[n_idx] if n_idx < len(orig_excel_row_vals) else ""
+                bid_val = orig_excel_row_vals[id_idx] if id_idx < len(orig_excel_row_vals) else ""
+                if bn_val and str(bn_val).lower() != 'none': b_var.set(bn_val)
+                if bid_val and str(bid_val).lower() != 'none': bid_var.set(bid_val)
+                b_dd.config(state='disabled'); dur_entry.config(state='disabled'); rdate_entry_w.config(state='disabled')
+            def process_action_lend():
+                upd_excel_row = list(orig_excel_row_vals)
+                if action == "Lend":
+                    bn_save = b_var.get().strip(); bid_save = bid_var.get().strip()
+                    bdt_save = bdt_var.get(); rdate_save = rdate_entry_w.get_date().strftime("%Y-%m-%d")
+                    if not bn_save or not bid_save: messagebox.showwarning("Warning", "Select borrower.", parent=popup); return
+                    if not dur_var.get().strip().isdigit() or int(dur_var.get().strip()) <= 0:
+                        messagebox.showwarning("Warning", "Duration positive.", parent=popup); return
+                    upd_excel_row[s_idx]='Lend'; upd_excel_row[n_idx]=bn_save; upd_excel_row[id_idx]=bid_save
+                    upd_excel_row[bd_idx]=bdt_save; upd_excel_row[rd_idx]=rdate_save
+                else:
+                    upd_excel_row[s_idx]='Available'; upd_excel_row[n_idx]='None'; upd_excel_row[id_idx]='None'
+                    upd_excel_row[bd_idx]='None'; upd_excel_row[rd_idx]='None'
+                try:
+                    wb_p = load_workbook(file_path); ws_p = wb_p.active; row_found_p = False
+                    for r_p_idx in range(2, ws_p.max_row + 1):
+                        if str(ws_p.cell(row=r_p_idx, column=excel_isbn_col_idx_p + 1).value) == sel_isbn:
+                            for c_p_idx, val_write in enumerate(upd_excel_row):
+                                if c_p_idx < ws_p.max_column: ws_p.cell(row=r_p_idx, column=c_p_idx + 1, value=val_write)
+                            row_found_p = True; break
+                    if row_found_p:
+                        wb_p.save(file_path); messagebox.showinfo("Success", f"Book {action.lower()}ed.", parent=root)
+                        popup.destroy(); show_lend_return_book_view()
+                    else: messagebox.showerror("Error", "Could not find book to update.", parent=popup)
+                except Exception as e_p: messagebox.showerror("Error", f"Save Error: {e_p}", parent=popup)
+            action_button = tk.Button(popup, text=action, command=process_action_lend, font=('Segoe UI', 10, 'bold'), bg=COLOR_PRIMARY_ACCENT, fg=COLOR_TEXT_ON_ACCENT, padx=15, pady=5)
+            action_button.pack(pady=15)
+        tk.Button(btn_frame_lend, text="🗑️ Delete", command=delete_selected_lend, font=('Segoe UI', 10, 'bold'), bg=COLOR_BUTTON_DELETE, fg=COLOR_TEXT_ON_ACCENT, padx=10, relief='flat').pack(side='left', padx=5)
+        tk.Button(btn_frame_lend, text="📤 Lend", command=lambda: prompt_borrower_info_lend("Lend"), font=('Segoe UI', 10, 'bold'), bg='#a35c46', fg=COLOR_TEXT_ON_ACCENT, padx=10, relief='flat').pack(side='left', padx=5)
+        tk.Button(btn_frame_lend, text="📥 Return", command=lambda: prompt_borrower_info_lend("Return"), font=('Segoe UI', 10, 'bold'), bg='#f57e64', fg=COLOR_TEXT_DARK, padx=10, relief='flat').pack(side='left', padx=5)
+        tk.Button(btn_frame_lend, text="📊 Open Excel", command=lambda: open_excel_file_externally(file_path, "Books Excel"), font=('Segoe UI', 10, 'bold'), bg="#4CAF50", fg="white", padx=10, relief='flat').pack(side='left', padx=5)
+    except Exception as e_show_data_main: messagebox.showerror("Error", f"Error loading book view: {e_show_data_main}")
+
+
+def get_unique_genres():
+    """Reads unique genres from the book Excel file."""
+    genres = set()
+    if os.path.exists(BOOK_FILE_PATH):
+        try:
+            wb = load_workbook(BOOK_FILE_PATH); sheet = wb.active
+            headers = [cell.value for cell in sheet[1]]
+            if 'Genre' in headers:
+                genre_col_idx = headers.index('Genre')
+                for row_idx in range(2, sheet.max_row + 1):
+                    g_val = sheet.cell(row=row_idx, column=genre_col_idx + 1).value
+                    if g_val: genres.add(str(g_val).strip())
+        except Exception as e: 
+            print(f"Error reading genres from Excel: {e}")
+    return sorted(list(genres)) if genres else ["General"] # Default if no genres found
+
+# ---------------------------------------------------------------------
+# --- Add Book Function ---
+# ---------------------------------------------------------------------
+    
+def add_book_form_view():
+    """Displays the form to add a new book and search existing books."""
+    clear_content_frame()
+    # Main container for this view
+    container = tk.Frame(content_frame, bg=COLOR_BACKGROUND_LIGHT)
+    container.pack(fill=tk.BOTH, expand=True)
+
+    # Heading for the Add Book / Search Book section
+    tk.Label(container, text="📖 Add Book --- Search Book", font=('Cambria', 18, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(20,10))
+    
+    # Main frame to hold the PanedWindow
+    main_form_frame = tk.Frame(container, bg=COLOR_BACKGROUND_LIGHT)
+    main_form_frame.pack(fill='both', expand=True, padx=20, pady=10)
+    
+    # PanedWindow for a resizable two-panel layout
+    paned_w = ttk.PanedWindow(main_form_frame, orient=tk.HORIZONTAL, style="Content.TPanedwindow")
+    paned_w.pack(fill=tk.BOTH, expand=True)
+
+    # --- Left Panel: Add New Book Form ---
+    left_p = ttk.Frame(paned_w, padding="15", style="Content.TFrame") # Increased padding
+    paned_w.add(left_p, weight=1) # Adjust weight if one panel should be larger by default
+    tk.Label(left_p, text="➕ Add New Book", font=('Cambria', 14, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(5,15), anchor='w')
+    
+    fields = ['Genre', 'Book Name', 'Author', 'ISBN']
+    entries = {} # To store entry widgets
+    unique_g = get_unique_genres()
+
+    for field in fields:
+        row_f = tk.Frame(left_p, bg=COLOR_BACKGROUND_LIGHT) # Frame for each label-entry pair
+        row_f.pack(fill='x', pady=4, padx=5)
+        tk.Label(row_f, text=f"{field}:", width=10, anchor='w', font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(side=tk.LEFT)
+        
+        if field == 'Genre':
+            g_var = tk.StringVar()
+            # Combobox for Genre selection, allowing new entries if 'normal' state
+            g_dd = ttk.Combobox(row_f, textvariable=g_var, values=unique_g, state='normal', width=27, font=('Segoe UI',10))
+            g_dd.pack(side='left',fill='x',expand=True)
+            entries[field]=g_dd
+        else:
+            # Standard Entry for other fields
+            ent_f = tk.Entry(row_f,width=30,font=('Segoe UI',10), relief='solid', bd=1)
+            ent_f.pack(side='left',fill='x',expand=True)
+            entries[field]=ent_f
+            
+    # --- Nested save_book_data_add function ---
+    def save_book_data_add():
+        try:
+            # Get values from form fields
+            genre=entries['Genre'].get().strip()
+            book_name=entries['Book Name'].get().strip() # Note: This maps to 'Title' in Excel in some contexts
+            author=entries['Author'].get().strip()
+            isbn=entries['ISBN'].get().strip()
+            
+            # Basic validation
+            if not all([isbn,book_name,author,genre]): messagebox.showwarning("Warning","Please fill all fields."); return
+            if not isbn.replace('-','').isdigit(): messagebox.showwarning("Warning","ISBN must contain only numbers (hyphens allowed)."); return
+            
+            # Ensure Excel file exists
+            if not os.path.exists(BOOK_FILE_PATH): initialize_excel_file(BOOK_FILE_PATH, BOOK_COLUMNS_DESIRED)
+            
+            wb_s = load_workbook(BOOK_FILE_PATH); ws_s = wb_s.active
+            # Ensure all columns are correctly set up in the sheet
+            upd_h, curr_excel_h = ensure_status_column(ws_s)
+            if upd_h: # If headers were modified, save and reload
+                wb_s.save(BOOK_FILE_PATH)
+                wb_s=load_workbook(BOOK_FILE_PATH); ws_s=wb_s.active
+                curr_excel_h=[c.value for c in ws_s[1] if c.value] # Get updated headers
+            
+            # Check for duplicate ISBN
+            isbn_col_s = curr_excel_h.index('ISBN') if 'ISBN' in curr_excel_h else -1
+            if isbn_col_s != -1:
+                for r_c in ws_s.iter_rows(min_row=2,max_col=isbn_col_s+1,values_only=True): # Only check ISBN column
+                    if r_c and str(r_c[isbn_col_s])==isbn: messagebox.showwarning("Warning","A book with this ISBN already exists!"); return
+            
+            # Prepare data for the new row based on actual Excel headers
+            new_b_map={
+                'ISBN':isbn, 'Book Name':book_name, 'Author':author, 'Genre':genre, # Map "Book Name" to "Title" for Excel
+                'Status':'Available', 'Borrower Name':'None', 'Borrower ID':'None', 
+                'Borrow Date':'', 'Return Date':''
+            }
+            new_r_list=[new_b_map.get(h,'') for h in curr_excel_h] # Ensure order matches Excel headers
+
+            # Read existing data to insert new book, sorted by Genre
+            exist_data=[]
+            if ws_s.max_row > 1: # If there's data beyond header
+                 exist_data=[[ws_s.cell(r,c+1).value for c in range(len(curr_excel_h))] for r in range(2,ws_s.max_row+1)]
+            
+            # Determine insertion point to group by Genre
+            ins_idx=len(exist_data) # Default to append at the end
+            genre_col_sort=curr_excel_h.index('Genre') if 'Genre' in curr_excel_h else -1
+            if genre_col_sort!=-1:
+                found_g=False
+                for i,r_s in enumerate(exist_data):
+                    if r_s and len(r_s)>genre_col_sort and str(r_s[genre_col_sort]).strip()==genre: # Found the genre block
+                        found_g=True; ins_idx=i+1 # Insert after the last item of this genre
+                    elif found_g and (not r_s or len(r_s)<=genre_col_sort or str(r_s[genre_col_sort]).strip()!=genre): # Passed the genre block
+                        ins_idx=i; break # Insert before the next different genre
+            
+            exist_data.insert(ins_idx,new_r_list) # Insert new book data
+            
+            # Clear existing rows (except header) and write all data back (including new book)
+            if ws_s.max_row>=2: ws_s.delete_rows(2,ws_s.max_row-1) # Delete all rows from row 2 to end
+            for r_w in exist_data: ws_s.append(r_w) # Append all rows (sorted with new one)
+            
+            wb_s.save(BOOK_FILE_PATH)
+            messagebox.showinfo("Success","Book saved successfully!")
+            
+            # Clear form fields
+            for f_e_widget in entries.values():
+                if isinstance(f_e_widget,ttk.Combobox): f_e_widget.set('') # Clear Combobox
+                else: f_e_widget.delete(0,tk.END) # Clear Entry
+            
+            # Refresh genre list for combobox and update the book display
+            entries['Genre']['values']=get_unique_genres()
+            display_books_in_add_form() # Refresh the Treeview in the right panel
+            
+        except Exception as e_s_a: 
+            messagebox.showerror("Error",f"Failed to save book: {e_s_a}")
+
+    # Save Book Button
+    tk.Button(left_p,text="Save Book",command=save_book_data_add,
+              font=('Segoe UI',10,'bold'),bg=COLOR_PRIMARY_ACCENT,fg=COLOR_TEXT_ON_ACCENT,
+              padx=15,pady=5, relief='flat', bd=0).pack(pady=15)
+    
+    # --- Right Panel: Search Book and Display List ---
+    right_p=ttk.Frame(paned_w,padding="10",style="Content.TFrame")
+    paned_w.add(right_p,weight=2) # Give more space to the book list
+    
+    # Search bar
+    search_f_add_p=tk.Frame(right_p,bg=COLOR_BACKGROUND_LIGHT)
+    search_f_add_p.pack(fill='x',pady=5,padx=5)
+    search_v_add=tk.StringVar()
+    search_e_add=tk.Entry(search_f_add_p,textvariable=search_v_add,width=35,font=('Segoe UI',10), relief='solid', bd=1)
+    search_e_add.pack(side='left',padx=(0,5),fill='x',expand=True)
+    tk.Button(search_f_add_p,text="🔍 Search",bg=COLOR_BUTTON_SECONDARY,fg=COLOR_TEXT_DARK,
+              font=('Segoe UI',10,'bold'),command=lambda: display_books_in_add_form(search_v_add.get()),
+              padx=10, relief='flat', bd=0).pack(side='left')
+    
+    # Frame to hold the Treeview or "no books" message
+    tree_f_add_p=tk.Frame(right_p,bg=COLOR_BACKGROUND_LIGHT)
+    tree_f_add_p.pack(fill='both',expand=True,padx=5,pady=(0,5))
+    
+    add_form_tree_w_ref=None # Reference to the Treeview in this panel
+
+    # --- Nested display_books_in_add_form function for the right panel ---
+    def display_books_in_add_form(query=""):
+        nonlocal add_form_tree_w_ref # Allow modification of the outer scope variable
+        # Clear previous content (Treeview or "no books" label)
+        for w_child in tree_f_add_p.winfo_children(): w_child.destroy()
+        add_form_tree_w_ref=None # Reset reference
+
+        try:
+            if not os.path.exists(BOOK_FILE_PATH): 
+                tk.Label(tree_f_add_p,text="Book file not found. Add books to create it.",
+                         bg=COLOR_BACKGROUND_LIGHT,fg=COLOR_TEXT_DARK, font=('Segoe UI', 10)).pack(pady=30); return
+            
+            wb_d=load_workbook(BOOK_FILE_PATH,data_only=True) # data_only for display values
+            sheet_d=wb_d.active
+
+            if sheet_d.max_row<=1: # Only header row or empty
+                tk.Label(tree_f_add_p,text="No book records found. Add books to see them here.",
+                         bg=COLOR_BACKGROUND_LIGHT,fg=COLOR_TEXT_DARK, font=('Segoe UI', 10)).pack(pady=30); return
+
+            # Ensure columns are up-to-date
+            upd_d,curr_excel_h_d=ensure_status_column(sheet_d)
+            if upd_d: # If headers changed, save and reload
+                wb_d.save(BOOK_FILE_PATH)
+                wb_d=load_workbook(BOOK_FILE_PATH,data_only=True); sheet_d=wb_d.active
+                curr_excel_h_d=[c.value for c in sheet_d[1] if c.value]
+            
+            # Columns to display in this specific Treeview
+            disp_cols_s=['Genre','Book Name','Author','ISBN']
+            # Mapping display names to actual Excel column names (if different)
+            excel_map_s={'Book Name':'Book Name','ISBN':'ISBN','Author':'Author','Genre':'Genre'} # 'Book Name' in UI, 'Title' in Excel
+
+            # Create scrollbars and Treeview
+            s_y=tk.Scrollbar(tree_f_add_p,orient="vertical"); s_x=tk.Scrollbar(tree_f_add_p,orient="horizontal")
+            curr_tree=ttk.Treeview(tree_f_add_p,columns=disp_cols_s,show='headings',
+                                   yscrollcommand=s_y.set,xscrollcommand=s_x.set,selectmode='browse')
+            add_form_tree_w_ref=curr_tree # Store reference
+            s_y.config(command=curr_tree.yview); s_x.config(command=curr_tree.xview)
+            s_y.pack(side='right',fill='y'); s_x.pack(side='bottom',fill='x')
+            curr_tree.pack(fill='both',expand=True)
+
+            # Set Treeview headings and column properties
+            for c_d_t in disp_cols_s: 
+                curr_tree.heading(c_d_t,text=c_d_t)
+                curr_tree.column(c_d_t,width=max(90,len(c_d_t)*9),anchor='w',minwidth=60) # Anchor 'w' for text
+
+            # Map Excel column names to indices for data retrieval
+            excel_col_to_idx_d={col:i for i,col in enumerate(curr_excel_h_d)}
+
+            # Populate Treeview
+            for r_n_d in range(2,sheet_d.max_row+1): # Start from row 2
+                full_excel_v=[sheet_d.cell(r_n_d,c_i+1).value for c_i in range(len(curr_excel_h_d))]
+                
+                # Prepare values for the limited columns displayed in this Treeview
+                disp_s_v=[]
+                for d_col_n_s in disp_cols_s:
+                    actual_excel_n = excel_map_s.get(d_col_n_s, d_col_n_s) # Use mapped Excel column name (e.g., Title for Book Name)
+                    if actual_excel_n in excel_col_to_idx_d:
+                        idx_v=excel_col_to_idx_d[actual_excel_n]
+                        if idx_v<len(full_excel_v): disp_s_v.append(full_excel_v[idx_v])
+                        else: disp_s_v.append('') # If data missing for a mapped column
+                    else: disp_s_v.append('') # If mapped column itself is not in Excel headers
+                
+                # Search logic (case-insensitive, searches all original values)
+                match=False
+                if not query: match=True # Show all if no query
+                else:
+                    for val_c in full_excel_v: # Search in the full original row from Excel
+                        if query.lower() in str(val_c).lower(): match=True; break
+                
+                if match: curr_tree.insert('','end',values=disp_s_v)
+        except Exception as e_d_a:
+            messagebox.showerror("Error",f"Error displaying books: {e_d_a}")
+            # Clear frame and show error if something went wrong
+            for w_child_err in tree_f_add_p.winfo_children(): w_child_err.destroy()
+            tk.Label(tree_f_add_p,text="Error displaying books. Check console.",
+                     bg=COLOR_BACKGROUND_LIGHT,fg="red",font=('Segoe UI',10)).pack(pady=30)
+            
+    display_books_in_add_form() # Initial display of books in the right panel
+
+# ---------------------------------------------------------------------
+# --- Member Management View (Corrected and Styled) ---
+# ---------------------------------------------------------------------
+
+def show_member_management_view():
+    """Displays the member management interface with add form and member list."""
+    clear_content_frame()
+    
+    # Main container for this view
+    view_container = tk.Frame(content_frame, bg=COLOR_BACKGROUND_LIGHT)
+    view_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+    # Initialize Member Excel File if it doesn't exist
+    initialize_excel_file(MEMBER_FILE_PATH, MEMBER_COLUMNS_DEFAULT)
+
+    # PanedWindow for resizable left (add form) and right (list) panels
+    paned_window = ttk.PanedWindow(view_container, orient=tk.HORIZONTAL, style="Content.TPanedwindow")
+    paned_window.pack(fill=tk.BOTH, expand=True)
+
+    # --- Left Pane: Add New Member Form ---
+    left_pane = ttk.Frame(paned_window, padding="15", style="Content.TFrame") # Increased padding
+    paned_window.add(left_pane, weight=1) # Adjust weight as needed
+
+    tk.Label(left_pane, text="➕ Add New Member", font=('Cambria', 16, 'bold'), 
+             bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(0, 15), anchor='w')
+    
+    member_entries = {} # Dictionary to store entry widgets
+    form_fields_frame = tk.Frame(left_pane, bg=COLOR_BACKGROUND_LIGHT) # Frame for form fields
+    form_fields_frame.pack(fill=tk.X)
+
+# Determine next Member ID automatically for the initial display of the form
+    next_member_id_str = "M001" # Default starting ID
+    highest_num_id = 0 # Keep track of the highest numeric part found
+
+    if os.path.exists(MEMBER_FILE_PATH):
+        try:
+            wb_id_initial = load_workbook(MEMBER_FILE_PATH)
+            ws_id_initial = wb_id_initial.active
+            
+            if ws_id_initial.max_row > 1: # If there are existing members (more than just header)
+                # Iterate through all existing Member IDs to find the highest
+                for row_num in range(2, ws_id_initial.max_row + 1): # Start from row 2
+                    cell_val = ws_id_initial.cell(row=row_num, column=1).value # Member ID is in column 1
+                    if cell_val and isinstance(cell_val, str) and cell_val.startswith('M'):
+                        try:
+                            num_part = int(cell_val[1:]) # Extract number part
+                            if num_part > highest_num_id:
+                                highest_num_id = num_part # Update highest found
+                        except ValueError:
+                            # Skip if the part after 'M' is not a valid number
+                            print(f"Warning: Could not parse number from Member ID '{cell_val}' in row {row_num}.")
+                            pass
+                
+                # Generate the next ID based on the highest found
+                if highest_num_id > 0:
+                    next_member_id_str = f"M{highest_num_id + 1:03d}"
+                # If no valid 'Mxxx' IDs were found but rows exist, highest_num_id remains 0,
+                # so next_member_id_str will be "M001" (M{0+1:03d}) which is correct for starting.
+
+        except Exception as e_id_initial: 
+            print(f"Error determining initial next member ID: {e_id_initial}")
+
+
+    # Create entry fields for each member attribute
+    for field in MEMBER_COLUMNS_DEFAULT:
+        row_frame = tk.Frame(form_fields_frame, bg=COLOR_BACKGROUND_LIGHT)
+        row_frame.pack(fill=tk.X, pady=3) # Small vertical padding between fields
+        tk.Label(row_frame, text=f"{field}:", width=12, anchor='w', font=('Segoe UI', 10), 
+                 bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(side=tk.LEFT, padx=(0,5))
+        
+        if field == "Start Date": # Use DateEntry for Start Date
+            entry_widget = DateEntry(row_frame, width=23, font=('Segoe UI', 10), date_pattern='yyyy-mm-dd',
+                                     background=COLOR_PRIMARY_ACCENT, foreground=COLOR_TEXT_ON_ACCENT, 
+                                     selectbackground=COLOR_BUTTON_SECONDARY, selectforeground=COLOR_TEXT_DARK,
+                                     normalbackground='white', weekendbackground='white', othermonthbackground='gainsboro',
+                                     headersbackground=COLOR_GRADIENT_MEDIUM, borderwidth=1, relief='solid')
+            entry_widget.set_date(datetime.now()) # Default to today
+        else: # Standard Entry for other fields
+            entry_widget = tk.Entry(row_frame, width=25, font=('Segoe UI', 10), relief='solid', bd=1)
+        
+        entry_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        member_entries[field] = entry_widget
+
+        # Pre-fill Member ID (read-only) and Status
+        if field == "Member ID": 
+            member_entries[field].insert(0, next_member_id_str)
+            member_entries[field].config(state='readonly') # Make Member ID read-only
+        if field == "Status": 
+            member_entries[field].insert(0, "Active") # Default status
+
+    # Reference to the Treeview in the right pane, for refreshing after adding/deleting
+    member_treeview_ref_local = None 
+
+    # --- Nested function to save new member data ---
+    def save_new_member_data():
+        nonlocal member_treeview_ref_local # Allow modification of this reference
+
+        # Collect data from form entries
+        values_dict = {} # Store as dictionary first for easier access
+        for field_name, entry_widget_val in member_entries.items():
+            if isinstance(entry_widget_val, DateEntry): # Handle DateEntry separately
+                values_dict[field_name] = entry_widget_val.get_date().strftime('%Y-%m-%d')
+            else:
+                values_dict[field_name] = entry_widget_val.get().strip()
+        
+        # Basic Validation (Member ID, Full Name, Contact are typically required)
+        if not values_dict["Member ID"] or not values_dict["Full Name"] or not values_dict["Contact"]:
+            messagebox.showwarning("Warning", "Member ID, Full Name, and Contact are required.", parent=left_pane)
+            return
+        
+        try:
+            wb_member_save = load_workbook(MEMBER_FILE_PATH)
+            ws_member_save = wb_member_save.active
+            
+            # Check for duplicate Member ID before saving
+            id_col_index = MEMBER_COLUMNS_DEFAULT.index("Member ID") # Get index of Member ID column
+            for row_check_mem in ws_member_save.iter_rows(min_row=2, values_only=True):
+                if row_check_mem and str(row_check_mem[id_col_index]) == values_dict["Member ID"]:
+                    messagebox.showwarning("Warning", "Member ID already exists. Please use a unique ID.", parent=left_pane)
+                    # Allow user to edit the auto-generated ID if it's a duplicate (should be rare if auto-increment works)
+                    member_entries["Member ID"].config(state='normal') 
+                    member_entries["Member ID"].delete(0, tk.END)
+                    member_entries["Member ID"].focus()
+                    return
+            
+            # Prepare row in the correct order for appending to Excel
+            row_to_append_list = [values_dict[col_name_order] for col_name_order in MEMBER_COLUMNS_DEFAULT]
+            
+            ws_member_save.append(row_to_append_list) # Append new member data
+            wb_member_save.save(MEMBER_FILE_PATH) # Save the workbook
+            messagebox.showinfo("Success", "Member added successfully!", parent=left_pane)
+            
+                        # Clear form entries and set defaults for the next entry
+            for field_name_clear, entry_widget_clear in member_entries.items():
+                if field_name_clear == "Member ID":
+                    current_saved_id_str = values_dict["Member ID"] 
+                    next_id_to_display = "M001" 
+                    if current_saved_id_str and current_saved_id_str.startswith('M'):
+                        try:
+                            current_saved_num = int(current_saved_id_str[1:])
+                            next_id_to_display = f"M{current_saved_num + 1:03d}" # String
+                        except ValueError:
+                            # ... fallback logic ...
+                            if ws_member_save.max_row > 1:
+                                last_id_from_sheet = ws_member_save.cell(row=ws_member_save.max_row, column=1).value
+                                if last_id_from_sheet and isinstance(last_id_from_sheet, str) and last_id_from_sheet.startswith('M'):
+                                    try:
+                                        last_num_from_sheet = int(last_id_from_sheet[1:])
+                                        next_id_to_display = f"M{last_num_from_sheet + 1:03d}" # String
+                                    except ValueError: pass
+                    
+                    entry_widget_clear.config(state='normal')
+                    entry_widget_clear.delete(0, tk.END)
+                    entry_widget_clear.insert(0, next_id_to_display) # THIS IS A STRING - should be fine
+                    entry_widget_clear.config(state='readonly')
+            
+            member_entries["Full Name"].focus() # Set focus to Full Name for quick next entry
+            
+            # Refresh the member list in the right pane
+            if member_treeview_ref_local: 
+                refresh_member_data_treeview(member_treeview_ref_local)
+
+        except Exception as e_mem_save:
+            messagebox.showerror("Error", f"Failed to save member: {e_mem_save}", parent=left_pane)
+
+    # "Add Member" button
+    tk.Button(left_pane, text="Add Member", command=save_new_member_data, 
+              font=('Segoe UI', 10, 'bold'), bg=COLOR_PRIMARY_ACCENT, fg=COLOR_TEXT_ON_ACCENT, 
+              relief='flat', bd=0, padx=15, pady=5).pack(pady=20, anchor='center')
+
+
+    # --- Right Pane: Member List and Actions ---
+    right_pane = ttk.Frame(paned_window, padding="10", style="Content.TFrame")
+    paned_window.add(right_pane, weight=3) # Give more weight to the table panel
+
+    # Search bar for members
+    search_frame = tk.Frame(right_pane, bg=COLOR_BACKGROUND_LIGHT)
+    search_frame.pack(fill=tk.X, pady=(0,10))
+    tk.Label(search_frame, text="Search Member ID:", font=('Segoe UI', 10), 
+             bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(side=tk.LEFT, padx=(0,5))
+    member_search_entry = tk.Entry(search_frame, width=30, font=('Segoe UI', 10), relief='solid', bd=1)
+    member_search_entry.pack(side=tk.LEFT, padx=(0,10), fill=tk.X, expand=True)
+    
+    # Frame to hold the Treeview and its scrollbars
+    tree_frame_member = tk.Frame(right_pane, bg=COLOR_BACKGROUND_LIGHT)
+    tree_frame_member.pack(fill=tk.BOTH, expand=True)
+
+    # Determine columns for Treeview from Excel header or defaults
+    actual_member_cols = MEMBER_COLUMNS_DEFAULT
+    if os.path.exists(MEMBER_FILE_PATH):
+        try:
+            wb_cols = load_workbook(MEMBER_FILE_PATH); ws_cols = wb_cols.active
+            if ws_cols.max_row > 0: # If header row exists
+                header_vals = [c.value for c in ws_cols[1] if c.value is not None and str(c.value).strip()]
+                if header_vals: actual_member_cols = header_vals # Use actual headers if found
+        except Exception: 
+            pass # Stick to defaults if error reading
+
+    # Create Treeview for members
+    member_treeview = ttk.Treeview(tree_frame_member, columns=actual_member_cols, show='headings', style="Treeview")
+    member_treeview.tag_configure('found', background=COLOR_GRADIENT_LIGHT, foreground=COLOR_TEXT_DARK) # For search highlight
+    member_treeview_ref_local = member_treeview # Assign to the reference for refresh
+
+    # Scrollbars for the Treeview
+    vsb_mem = ttk.Scrollbar(tree_frame_member, orient="vertical", command=member_treeview.yview)
+    hsb_mem = ttk.Scrollbar(tree_frame_member, orient="horizontal", command=member_treeview.xview)
+    member_treeview.configure(yscrollcommand=vsb_mem.set, xscrollcommand=hsb_mem.set)
+    vsb_mem.pack(side='right', fill='y')
+    hsb_mem.pack(side='bottom', fill='x')
+    member_treeview.pack(side='left', fill='both', expand=True)
+
+    # Set Treeview column headings and properties
+    for col_name_mem in actual_member_cols:
+        member_treeview.heading(col_name_mem, text=col_name_mem)
+        member_treeview.column(col_name_mem, width=max(90, len(col_name_mem)*9), anchor='w', minwidth=60) # Anchor 'w' for text
+
+    # --- Nested function for searching members ---
+    def search_member_by_id_action():
+        search_id_val = member_search_entry.get().strip().upper()
+        found_mem = False
+        # Ensure "Member ID" column exists for searching
+        id_col_idx_search = actual_member_cols.index("Member ID") if "Member ID" in actual_member_cols else -1
+        if id_col_idx_search == -1: 
+            messagebox.showwarning("Configuration Error", "Member ID column not defined for search.")
+            return
+
+        for item_id_mem_tree in member_treeview.get_children():
+            member_treeview.item(item_id_mem_tree, tags=()) # Clear previous highlight
+            row_vals_mem_tree = member_treeview.item(item_id_mem_tree)['values']
+            # Check if Member ID matches
+            if row_vals_mem_tree and len(row_vals_mem_tree) > id_col_idx_search and \
+               str(row_vals_mem_tree[id_col_idx_search]).strip().upper() == search_id_val:
+                member_treeview.selection_set(item_id_mem_tree) # Select found item
+                member_treeview.focus(item_id_mem_tree)         # Set focus
+                member_treeview.see(item_id_mem_tree)           # Scroll to make it visible
+                member_treeview.item(item_id_mem_tree, tags=('found',)) # Apply highlight tag
+                found_mem=True
+                break # Stop after first match
+        
+        if not found_mem and search_id_val: # If search term was entered but no match
+            messagebox.showinfo("Not Found", "Member ID not found.")
+        # Optionally clear search entry after search: member_search_entry.delete(0, tk.END)
+
+    # Search button
+    tk.Button(search_frame, text="Search", command=search_member_by_id_action, 
+              font=('Segoe UI', 10, 'bold'), bg=COLOR_BUTTON_SECONDARY, fg=COLOR_TEXT_DARK, 
+              relief='flat', bd=0, padx=10, pady=2).pack(side='left')
+    
+    refresh_member_data_treeview(member_treeview) # Initial load of member data into Treeview
+
+    # Frame for action buttons (Delete, Open Excel) below the member list
+    action_buttons_member_frame = tk.Frame(right_pane, bg=COLOR_BACKGROUND_LIGHT)
+    action_buttons_member_frame.pack(fill=tk.X, pady=(10,0))
+
+    # --- Nested function for deleting selected members ---
+    def delete_selected_member_action():
+        selected_items_mem_del = member_treeview.selection() # Get selected item(s)
+        if not selected_items_mem_del: 
+            messagebox.showwarning("Warning", "Please select a member to delete."); return
+        if not messagebox.askyesno("Confirm Deletion", "Are you sure you want to delete the selected member(s)?"):
+            return
+        
+        wb_mem_del_load = load_workbook(MEMBER_FILE_PATH)
+        ws_mem_del_load = wb_mem_del_load.active
+        current_header_mem_del = [c.value for c in ws_mem_del_load[1] if c.value is not None and str(c.value).strip()]
+        
+        rows_to_keep_list_mem = []
+        selected_ids_to_delete_set_mem = set() # Use a set for efficient lookup of IDs to delete
+        
+        # Get Member ID column index from the current header
+        id_col_idx_mem_del_check = current_header_mem_del.index("Member ID") if "Member ID" in current_header_mem_del else -1
+
+        # Collect Member IDs of selected rows from Treeview
+        for item_id_mem_del_tree in selected_items_mem_del:
+            item_vals_mem_del = member_treeview.item(item_id_mem_del_tree)['values']
+            if item_vals_mem_del and id_col_idx_mem_del_check != -1 and len(item_vals_mem_del) > id_col_idx_mem_del_check:
+                selected_ids_to_delete_set_mem.add(str(item_vals_mem_del[id_col_idx_mem_del_check]).strip())
+
+        # Iterate through Excel, keeping rows NOT in the deletion set
+        for row_vals_mem_del_excel in ws_mem_del_load.iter_rows(min_row=2, values_only=True):
+            if not row_vals_mem_del_excel or not any(str(v).strip() for v in row_vals_mem_del_excel if v is not None): continue # Skip entirely blank/empty rows
+            
+            member_id_in_row_excel = None
+            if id_col_idx_mem_del_check != -1 and len(row_vals_mem_del_excel) > id_col_idx_mem_del_check:
+                member_id_in_row_excel = str(row_vals_mem_del_excel[id_col_idx_mem_del_check]).strip()
+            
+            if member_id_in_row_excel not in selected_ids_to_delete_set_mem:
+                rows_to_keep_list_mem.append(list(row_vals_mem_del_excel))
+        
+        # Rewrite the sheet with the filtered data
+        new_wb_mem_del_save = Workbook()
+        new_ws_mem_del_save = new_wb_mem_del_save.active
+        new_ws_mem_del_save.append(current_header_mem_del) # Add header
+        for row_data_mem_del_save in rows_to_keep_list_mem: # Add data rows
+            new_ws_mem_del_save.append(row_data_mem_del_save)
+        
+        try:
+            new_wb_mem_del_save.save(MEMBER_FILE_PATH) # Save changes
+            messagebox.showinfo("Info", f"{len(selected_ids_to_delete_set_mem)} Member(s) deleted.")
+            refresh_member_data_treeview(member_treeview) # Refresh the Treeview
+        except PermissionError: 
+            messagebox.showerror("Error", f"Permission denied for {MEMBER_FILE_PATH}. File might be open.")
+        except Exception as e_mem_del_save: 
+            messagebox.showerror("Error", f"Failed to delete member(s): {e_mem_del_save}")
+
+    # "Delete Selected" button
+    tk.Button(action_buttons_member_frame, text="🗑 Delete Selected", command=delete_selected_member_action, 
+              font=('Segoe UI', 10, 'bold'), bg=COLOR_BUTTON_DELETE, fg=COLOR_TEXT_ON_ACCENT, 
+              relief='flat', bd=0, padx=10, pady=5).pack(side=tk.LEFT, padx=5)
+    # "Open Excel" button
+    tk.Button(action_buttons_member_frame, text="📂 Open Excel", command=lambda: open_excel_file_externally(MEMBER_FILE_PATH, "Members Excel"), 
+              font=('Segoe UI', 10, 'bold'), bg="#4CAF50", fg="white", # Standard green
+              relief='flat', bd=0, padx=10, pady=5).pack(side=tk.LEFT, padx=5)
+
+
+def refresh_member_data_treeview(tree_widget_mem_ref):
+    """Refreshes the given member Treeview with data from the Excel file."""
+    # Clear existing items
+    for item_mem_tree in tree_widget_mem_ref.get_children(): 
+        tree_widget_mem_ref.delete(item_mem_tree)
+    
+    if not os.path.exists(MEMBER_FILE_PATH): return # Exit if file doesn't exist
+
+    try:
+        wb_mem_refresh = load_workbook(MEMBER_FILE_PATH)
+        ws_mem_refresh = wb_mem_refresh.active
+        
+        # Get actual column headers from Excel
+        current_header_mem_refresh = [c.value for c in ws_mem_refresh[1] if c.value is not None and str(c.value).strip()]
+        if not current_header_mem_refresh : current_header_mem_refresh = MEMBER_COLUMNS_DEFAULT # Fallback
+        
+        # Configure Treeview columns
+        tree_widget_mem_ref["columns"] = current_header_mem_refresh
+        for col_mem_refresh_tree in current_header_mem_refresh:
+            tree_widget_mem_ref.heading(col_mem_refresh_tree, text=col_mem_refresh_tree)
+            # Adjust column width based on header text length, with min/max constraints
+            tree_widget_mem_ref.column(col_mem_refresh_tree, width=max(90, len(col_mem_refresh_tree)*9), anchor='w', minwidth=60)
+
+        # Populate Treeview with data
+        for row_mem_refresh_iter in ws_mem_refresh.iter_rows(min_row=2, values_only=True):
+            cleaned_row_mem_refresh = ["" if val is None else val for val in row_mem_refresh_iter]
+            # Ensure we only insert as many values as there are columns defined in the tree
+            tree_widget_mem_ref.insert('', 'end', values=cleaned_row_mem_refresh[:len(current_header_mem_refresh)]) 
+    except Exception as e_mem_refresh: 
+        messagebox.showerror("Error", f"Could not refresh member list: {e_mem_refresh}")
+
+# ---------------------------------------------------------------------
+# --- Show Progress View ---
+# ---------------------------------------------------------------------
+def show_progress_view():
+    """Displays an overview of library statistics (books and members)."""
+    clear_content_frame()
+    progress_container = tk.Frame(content_frame, bg=COLOR_BACKGROUND_LIGHT)
+    progress_container.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+
+    tk.Label(progress_container, text="📊 Progress Overview", 
+             font=('Cambria', 20, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=(0, 25), anchor='center')
+    
+    # --- Book Statistics Section ---
+    book_stats_outer_frame = tk.Frame(progress_container, bg=COLOR_BACKGROUND_LIGHT)
+    book_stats_outer_frame.pack(fill=tk.X, pady=10)
+    tk.Label(book_stats_outer_frame, text="Book Statistics", 
+             font=('Segoe UI', 14, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(anchor='w', pady=(0,10))
+    
+    book_stats_frame = tk.Frame(book_stats_outer_frame, bg=COLOR_BACKGROUND_LIGHT) # Inner frame for grid layout
+    book_stats_frame.pack(fill=tk.X, padx=10)
+
+    # Initialize book stats
+    total_books, books_checked_out, books_available = 0, 0, 0
+    genre_counts = Counter() # To count books per genre
+    member_borrow_counts = Counter() # To count books borrowed by member ID (current checkouts)
+
+    if os.path.exists(BOOK_FILE_PATH):
+        try:
+            wb_books = load_workbook(BOOK_FILE_PATH); ws_books = wb_books.active
+            if ws_books.max_row > 1 : total_books = ws_books.max_row - 1 # Exclude header
+            
+            headers_books = [cell.value for cell in ws_books[1]] # Get headers
+            status_col_idx = headers_books.index('Status') if 'Status' in headers_books else -1
+            genre_col_idx = headers_books.index('Genre') if 'Genre' in headers_books else -1
+            borrower_id_col_idx = headers_books.index('Borrower ID') if 'Borrower ID' in headers_books else -1
+
+            if total_books > 0:
+                for row in ws_books.iter_rows(min_row=2, values_only=True):
+                    # Count checked-out books and current borrows per member
+                    if status_col_idx != -1 and row[status_col_idx] == 'Lend': 
+                        books_checked_out += 1
+                        if borrower_id_col_idx != -1 and row[borrower_id_col_idx] and str(row[borrower_id_col_idx]).lower() != 'none':
+                            member_borrow_counts[str(row[borrower_id_col_idx])] += 1
+                    # Count books per genre
+                    if genre_col_idx != -1 and row[genre_col_idx]:
+                        genre_counts[str(row[genre_col_idx])] += 1
+            books_available = total_books - books_checked_out
+        except Exception as e_books: 
+            print(f"Error reading book statistics: {e_books}")
+    
+    # Display book counts
+    tk.Label(book_stats_frame, text=f"Total Books: {total_books}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=0, column=0, sticky='w', padx=5, pady=2)
+    tk.Label(book_stats_frame, text=f"Lend: {books_checked_out}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=1, column=0, sticky='w', padx=5, pady=2)
+    tk.Label(book_stats_frame, text=f"Available: {books_available}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=2, column=0, sticky='w', padx=5, pady=2)
+
+    # Calculate percentages for progress bars
+    percent_checked_out = (books_checked_out / total_books * 100) if total_books > 0 else 0
+    percent_available = (books_available / total_books * 100) if total_books > 0 else 0
+
+    # Progress bar for checked-out books
+    bar_checked_out = ttk.Progressbar(book_stats_frame, orient='horizontal', length=200, mode='determinate', value=percent_checked_out, style="ProgressInactive.Horizontal.TProgressbar")
+    bar_checked_out.grid(row=1, column=1, padx=10, pady=2, sticky='ew')
+    tk.Label(book_stats_frame, text=f"{percent_checked_out:.1f}%", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=1, column=2, sticky='w')
+    
+    # Progress bar for available books
+    bar_available = ttk.Progressbar(book_stats_frame, orient='horizontal', length=200, mode='determinate', value=percent_available, style="ProgressActive.Horizontal.TProgressbar")
+    bar_available.grid(row=2, column=1, padx=10, pady=2, sticky='ew')
+    tk.Label(book_stats_frame, text=f"{percent_available:.1f}%", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=2, column=2, sticky='w')
+    
+    book_stats_frame.grid_columnconfigure(1, weight=1) # Make progress bar column expandable
+
+    # --- Member Statistics Section ---
+    member_stats_outer_frame = tk.Frame(progress_container, bg=COLOR_BACKGROUND_LIGHT)
+    member_stats_outer_frame.pack(fill=tk.X, pady=20)
+    tk.Label(member_stats_outer_frame, text="Member Statistics", 
+             font=('Segoe UI', 14, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(anchor='w', pady=(0,10))
+
+    member_stats_frame = tk.Frame(member_stats_outer_frame, bg=COLOR_BACKGROUND_LIGHT) # Inner frame
+    member_stats_frame.pack(fill=tk.X, padx=10)
+    
+    # Initialize member stats
+    active_members, inactive_members, total_members = 0,0,0
+    if os.path.exists(MEMBER_FILE_PATH):
+        try:
+            wb_members = load_workbook(MEMBER_FILE_PATH); ws_members = wb_members.active
+            if ws_members.max_row > 1: total_members = ws_members.max_row - 1 # Exclude header
+            
+            headers_members = [cell.value for cell in ws_members[1]]
+            status_col_idx_mem = headers_members.index('Status') if 'Status' in headers_members else -1
+            
+            if status_col_idx_mem != -1 and total_members > 0:
+                for row in ws_members.iter_rows(min_row=2, values_only=True):
+                    if status_col_idx_mem < len(row) and row[status_col_idx_mem] == 'Active': # Check index bound
+                        active_members += 1
+                    else: 
+                        inactive_members +=1 # Assuming anything not 'Active' or if status is missing/malformed
+        except Exception as e_members: 
+            print(f"Error reading member statistics: {e_members}")
+    
+    # Display member counts
+    tk.Label(member_stats_frame, text=f"Total Members: {total_members}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=0, column=0, sticky='w', padx=5, pady=2)
+    tk.Label(member_stats_frame, text=f"Active Members: {active_members}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=1, column=0, sticky='w', padx=5, pady=2)
+    tk.Label(member_stats_frame, text=f"Inactive Members: {inactive_members}", font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=2, column=0, sticky='w', padx=5, pady=2)
+
+    # Calculate percentages for member progress bars
+    percent_active_mem = (active_members / total_members * 100) if total_members > 0 else 0
+    percent_inactive_mem = (inactive_members / total_members * 100) if total_members > 0 else 0
+
+    # Progress bar for active members
+    bar_active_mem = ttk.Progressbar(member_stats_frame, orient='horizontal', length=200, mode='determinate', value=percent_active_mem, style="ProgressActive.Horizontal.TProgressbar")
+    bar_active_mem.grid(row=1, column=1, padx=10, pady=2, sticky='ew')
+    tk.Label(member_stats_frame, text=f"{percent_active_mem:.1f}%", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=1, column=2, sticky='w')
+    
+    # Progress bar for inactive members
+    bar_inactive_mem = ttk.Progressbar(member_stats_frame, orient='horizontal', length=200, mode='determinate', value=percent_inactive_mem, style="ProgressInactive.Horizontal.TProgressbar")
+    bar_inactive_mem.grid(row=2, column=1, padx=10, pady=2, sticky='ew')
+    tk.Label(member_stats_frame, text=f"{percent_inactive_mem:.1f}%", font=('Segoe UI', 10), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).grid(row=2, column=2, sticky='w')
+    
+    member_stats_frame.grid_columnconfigure(1, weight=1) # Make progress bar column expandable
+
+    # --- Additional Library Insights Section ---
+    insights_frame = tk.Frame(progress_container, bg=COLOR_BACKGROUND_LIGHT)
+    insights_frame.pack(fill=tk.X, pady=20)
+    tk.Label(insights_frame, text="Library Insights", 
+             font=('Segoe UI', 14, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(anchor='w', pady=(0,10))
+    
+    insights_content_frame = tk.Frame(insights_frame, bg=COLOR_BACKGROUND_LIGHT) # Inner frame
+    insights_content_frame.pack(fill=tk.X, padx=10)
+
+    # Most Popular Genre (based on current book counts)
+    most_popular_genre_str = "N/A"
+    if genre_counts:
+        popular_genre = genre_counts.most_common(1) # Get the most common genre
+        if popular_genre: 
+            most_popular_genre_str = f"{popular_genre[0][0]} ({popular_genre[0][1]} books)"
+    tk.Label(insights_content_frame, text=f"Most Popular Genre: {most_popular_genre_str}", 
+             font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(anchor='w', pady=2)
+    
+    # Most Active Borrower (based on *current* checkouts, not historical borrowing)
+    most_active_member_str = "N/A"
+    if member_borrow_counts: 
+        active_borrower = member_borrow_counts.most_common(1) # Get member with most current borrows
+        if active_borrower: 
+            most_active_member_str = f"Member ID {active_borrower[0][0]} ({active_borrower[0][1]} books currently borrowed)"
+    tk.Label(insights_content_frame, text=f"Most Active Borrower (Current): {most_active_member_str}", 
+             font=('Segoe UI', 11), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(anchor='w', pady=2)
+
+
+# -------------------------------------------
+# -------- Main Application Setup --------
+# -------------------------------------------
+
+root = tk.Tk()
+root.title("Readora — Library Management System")
+root.state('zoomed') # Maximize window on start
+root.configure(bg=COLOR_BACKGROUND_LIGHT) # Set root background
+
+# --- ttk Styles ---
+style = ttk.Style(root)
+style.theme_use('clam') # 'clam' is often good for custom styling
+
+# Custom styles for ttk widgets using the new color palette
+style.configure("Content.TFrame", background=COLOR_BACKGROUND_LIGHT)
+style.configure("Content.TLabel", background=COLOR_BACKGROUND_LIGHT, foreground=COLOR_TEXT_DARK, font=('Segoe UI', 10))
+style.configure("Content.TPanedwindow", background=COLOR_BACKGROUND_LIGHT)
+
+# ttk Button styles (alternative to tk.Button if preferred)
+style.configure("PrimaryAccent.TButton", foreground=COLOR_TEXT_ON_ACCENT, background=COLOR_PRIMARY_ACCENT, font=('Segoe UI', 10, 'bold'), borderwidth=0, relief='flat')
+style.map("PrimaryAccent.TButton", background=[('active', COLOR_PRIMARY_ACCENT)]) # Flat look on active
+style.configure("ButtonSecondary.TButton", foreground=COLOR_TEXT_DARK, background=COLOR_BUTTON_SECONDARY, font=('Segoe UI', 10, 'bold'), borderwidth=0, relief='flat')
+style.map("ButtonSecondary.TButton", background=[('active', COLOR_BUTTON_SECONDARY)])
+style.configure("ButtonDelete.TButton", foreground=COLOR_TEXT_ON_ACCENT, background=COLOR_BUTTON_DELETE, font=('Segoe UI', 10, 'bold'), borderwidth=0, relief='flat')
+style.map("ButtonDelete.TButton", background=[('active', "#D32F2F")]) # Slightly darker red on active
+style.configure("ButtonOpenExcel.TButton", foreground="white", background="#4CAF50", font=('Segoe UI', 10, 'bold'), borderwidth=0, relief='flat')
+style.map("ButtonOpenExcel.TButton", background=[('active', "#45A045")])
+
+# Treeview styling
+style.configure("Treeview.Heading", font=('Segoe UI', 10, 'bold'), background=COLOR_GRADIENT_MEDIUM, foreground=COLOR_TEXT_DARK, relief='flat')
+style.map("Treeview.Heading", background=[('active', COLOR_PRIMARY_ACCENT)], foreground=[('active', COLOR_TEXT_ON_ACCENT)])
+style.configure("Treeview", background="white", fieldbackground="white", foreground=COLOR_TEXT_DARK, relief='sunken', borderwidth=1, rowheight=25)
+style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})]) # Ensure tree area fills its allocated space
+
+# Progressbar styling
+style.configure("ProgressActive.Horizontal.TProgressbar", troughcolor=COLOR_PROGRESS_TROUGH, background=COLOR_PROGRESS_ACTIVE, thickness=15, borderwidth=0)
+style.configure("ProgressInactive.Horizontal.TProgressbar", troughcolor=COLOR_PROGRESS_TROUGH, background=COLOR_PROGRESS_INACTIVE, thickness=15, borderwidth=0)
+
+
+# --- Header ---
+header_canvas = tk.Canvas(root, height=70, highlightthickness=0)
+header_canvas.pack(fill='x')
+header_canvas.bind("<Configure>", lambda e: draw_horizontal_gradient(header_canvas, root.winfo_width(), e.height, COLOR_GRADIENT_LIGHT, COLOR_GRADIENT_MEDIUM))
+tk.Label(root, text="📚 Readora", font=('Segoe UI', 24, 'bold'), bg=COLOR_GRADIENT_LIGHT, fg=COLOR_TEXT_DARK).place(x=20, y=10)
+
+# --- Main Application Area (Sidebar + Content) ---
+main_app_frame = tk.Frame(root, bg=COLOR_BACKGROUND_LIGHT)
+main_app_frame.pack(fill='both', expand=True)
+
+
+# --- Sidebar ---
+sidebar_canvas = tk.Canvas(main_app_frame, width=220, highlightthickness=0, bg=COLOR_SIDEBAR_GRADIENT_END) # End color for base
+sidebar_canvas.pack(side='left', fill='y')
+sidebar_canvas.bind("<Configure>", lambda e: draw_vertical_gradient(sidebar_canvas, e.width, e.height, COLOR_GRADIENT_MEDIUM, COLOR_SIDEBAR_GRADIENT_END))
+
+# Frame inside sidebar canvas to hold navigation buttons
+nav_frame_sidebar = tk.Frame(sidebar_canvas, bg=COLOR_SIDEBAR_BTN_BG) # Match button background for seamless look
+sidebar_canvas.create_window((0, 0), window=nav_frame_sidebar, anchor='nw', width=220) # Ensure frame uses full width
+
+# Configure scrolling for sidebar if content overflows (not typical for fixed buttons but good practice)
+def configure_sidebar_scroll(event): 
+    sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+nav_frame_sidebar.bind("<Configure>", configure_sidebar_scroll)
+
+
+# --- Content Frame (where different views will be displayed) ---
+content_frame = tk.Frame(main_app_frame, bg=COLOR_BACKGROUND_LIGHT)
+content_frame.pack(side='right', fill='both', expand=True)
+
+
+# --- Navigation Buttons in Sidebar ---
+nav_options_sidebar = {
+    "📖 View Books": show_lend_return_book_view,
+    "➕ Add Book": add_book_form_view,
+    "📈 Show Progress": show_progress_view,
+    "👤 Member Management": show_member_management_view,
+    "🚪 Exit": root.quit
+}
+
+for label_text_sidebar, command_func_sidebar in nav_options_sidebar.items():
+    btn_sidebar = tk.Button(nav_frame_sidebar, text=label_text_sidebar, command=command_func_sidebar,
+                    font=('Segoe UI', 10, 'bold'),
+                    bg=COLOR_SIDEBAR_BTN_BG, fg=COLOR_TEXT_DARK, relief='flat', bd=0,
+                    activebackground=COLOR_PRIMARY_ACCENT, activeforeground=COLOR_TEXT_ON_ACCENT,
+                    width=22, pady=10, cursor='hand2', anchor='w', padx=15) # anchor='w' for left-align text
+    btn_sidebar.bind("<Enter>", on_nav_button_enter)
+    btn_sidebar.bind("<Leave>", on_nav_button_leave)
+    btn_sidebar.pack(pady=7, padx=10, fill='x') # fill='x' to make buttons take full width of nav_frame
+
+
+# --- Initial View / Welcome Message ---
+initial_welcome_frame = tk.Frame(content_frame, bg=COLOR_BACKGROUND_LIGHT)
+initial_welcome_frame.pack(fill=tk.BOTH, expand=True)
+tk.Label(initial_welcome_frame, text="✨ Welcome to Readora Library System",
+         font=('Cambria', 22, 'bold'), bg=COLOR_BACKGROUND_LIGHT, fg=COLOR_TEXT_DARK).pack(pady=50, padx=50)
+
+# --- Start the Tkinter main loop ---
+root.mainloop()
